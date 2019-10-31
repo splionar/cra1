@@ -1,0 +1,13 @@
+<launch>
+  <arg name="veh"/>
+  <arg name="pkg_name" value="augmented_reality"/>
+  <arg name="node_name" default="augmented_reality_node"/>
+  <arg name="param_file_name" default="duckiebot" doc="Specify a param file. ex:megaman"/>
+
+  <group ns="$(arg veh)">
+    <node name="augmented_reality_node" pkg="$(arg pkg_name)" type="augmented_reality.py" output="screen" required="true">
+      <rosparam command="load" file="$(find augmented_reality)/config/$(arg node_name)/$(arg param_file_name).yaml"/>
+    </node>
+  </group>
+
+</launch>

@@ -1,0 +1,11 @@
+<package>
+  <name>augmented_reality</name>
+  <version>0.1.0</version>
+  <description>
+  This package is a test for CRA1.
+  </description>
+  <maintainer email="splionar@gmail.com">Stefan Lionar</maintainer>
+  <license>None</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+</package>

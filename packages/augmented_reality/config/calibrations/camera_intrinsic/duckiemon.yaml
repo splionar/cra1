@@ -1,0 +1,23 @@
+camera_matrix:
+  cols: 3
+  data: [307.8604389080721, 0.0, 317.6050217693687, 0.0, 307.2442738587782, 237.21476607642225,
+    0.0, 0.0, 1.0]
+  rows: 3
+camera_name: duckiemon/camera_node
+distortion_coefficients:
+  cols: 5
+  data: [-0.3044250543986373, 0.07507475239663657, 0.00025858120260859133, 0.00041151977498918014,
+    0.0]
+  rows: 1
+distortion_model: plumb_bob
+image_height: 480
+image_width: 640
+projection_matrix:
+  cols: 4
+  data: [222.7889404296875, 0.0, 318.26033486511733, 0.0, 0.0, 235.2107696533203,
+    235.77321014743757, 0.0, 0.0, 0.0, 1.0, 0.0]
+  rows: 3
+rectification_matrix:
+  cols: 3
+  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  rows: 3
