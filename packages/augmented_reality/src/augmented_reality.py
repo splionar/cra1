@@ -1,295 +1,163 @@
 #!/usr/bin/env python
-import io
 import os
 import thread
 import yaml
 import rospy
 import copy
 import numpy as np
+import cv2
+from duckietown_utils.yaml_wrap import yaml_load_file
+import sys
 
 from duckietown import DTROS
-from picamera import PiCamera
 from sensor_msgs.msg import CompressedImage, CameraInfo
-from sensor_msgs.srv import SetCameraInfo, SetCameraInfoResponse
+from image_geometry import PinholeCameraModel
+from cv_bridge import CvBridge
 
 class Augmenter(DTROS):
-    """Handles the imagery.
-
-    The node handles the image stream, initializing it, publishing frames
-    according to the required frequency and stops it at shutdown.
-    `Picamera <https://picamera.readthedocs.io/>`_ is used for handling the image stream.
-
-    Note that only one :obj:`PiCamera` object should be used at a time. If another node tries to start
-    an instance while this node is running, it will likely fail with an `Out of resource` exception.
-
-    The configuration parameters can be changed dynamically while the node is running via `rosparam set` commands.
-
-    Args:
-        node_name (:obj:`str`): a unique, descriptive name for the node that ROS will use
-
-    Configuration:
-        ~framerate (:obj:`float`): The camera image acquisition framerate, default is 30.0 fps
-        ~res_w (:obj:`int`): The desired width of the acquired image, default is 640px
-        ~res_h (:obj:`int`): The desired height of the acquired image, default is 480px
-        ~exposure_mode (:obj:`str`): PiCamera exposure mode, one of `these <https://picamera.readthedocs.io/en/latest/api_camera.html?highlight=sport#picamera.PiCamera.exposure_mode>`_, default is `sports`
-
-    Publisher:
-        ~image/compressed (:obj:`CompressedImage`): The acquired camera images
-
-    Service:
-        ~set_camera_info:
-            Saves a provided camera info to `/data/config/calibrations/camera_intrinsic/HOSTNAME.yaml`.
-
-            input:
-                camera_info (`CameraInfo`): The camera information to save
-
-            outputs:
-                success (`bool`): `True` if the call succeeded
-                status_message (`str`): Used to give details about success
-
-    """
 
     def __init__(self, node_name):
 
         # Initialize the DTROS parent class
         super(Augmenter, self).__init__(node_name=node_name)
 
-        # Add the node parameters to the parameters dictionary and load their default values
-        self.parameters['~framerate'] = None
-        self.parameters['~res_w'] = None
-        self.parameters['~res_h'] = None
-        self.parameters['~exposure_mode'] = None
-        self.updateParameters()
+        #Get vehicle name
+        self.veh_name = str(rospy.get_namespace())
+        self.veh_name = str(self.veh_name[1:-1])
 
-        # Setup PiCamera
-        self.image_msg = CompressedImage()
-        self.camera = PiCamera()
-        self.camera.framerate = self.parameters['~framerate']
-        self.camera.resolution = (self.parameters['~res_w'], self.parameters['~res_h'])
-        self.camera.exposure_mode = self.parameters['~exposure_mode']
-
-
-        # For intrinsic calibration
-        self.cali_file_folder = '/code/catkin_ws/src/cra1/packages/augmented_reality/config/calibrations/camera_intrinsic/'
-        self.frame_id = rospy.get_namespace().strip('/') + '/camera_optical_frame'
-        self.cali_file = self.cali_file_folder + rospy.get_namespace().strip("/") + ".yaml"
-
-        # Locate calibration yaml file or use the default otherwise
-        if not os.path.isfile(self.cali_file):
-            self.log("Can't find calibration file: %s.\n Using default calibration instead."
-                          % self.cali_file, 'warn')
-            self.cali_file = (self.cali_file_folder + "default.yaml")
-
-        # Shutdown if no calibration file not found
-        if not os.path.isfile(self.cali_file):
-            rospy.signal_shutdown("Found no calibration file ... aborting")
-
-        # Load the calibration file
-        self.original_camera_info = self.loadCameraInfo(self.cali_file)
-        self.original_camera_info.header.frame_id = self.frame_id
-        self.current_camera_info = copy.deepcopy(self.original_camera_info)
-        #self.updateCameraParameters()
-        self.log("Using calibration file: %s" % self.cali_file)
-
-        # Setup publishers
-        self.has_published = False
-        # self.pub_img = rospy.Publisher("~image/compressed", CompressedImage, queue_size=1)
-        # self.pub_camera_info = rospy.Publisher("~camera_info", CameraInfo, queue_size=1)
-        self.pub_img = self.publisher("~image/compressed", CompressedImage, queue_size=1)
-        self.pub_camera_info = self.publisher("~camera_info", CameraInfo, queue_size=1)
-
-        # Setup service (for camera_calibration)
-        self.srv_set_camera_info = rospy.Service("~set_camera_info",
-                                                 SetCameraInfo,
-                                                 self.cbSrvSetCameraInfo)
-        self.stream = io.BytesIO()
-
-        self.log("Initialized.")
-
-    def startCapturing(self):
-        """Initialize and closes image stream.
-
-            Begin the camera capturing. When the node shutdowns, closes the
-            image stream. If it detects StopIteration exception from the `grabAndPublish`
-            generator due to parameter change, will update the parameters and
-            restart the image capturing.
-        """
-        self.log("Start capturing.")
-        while not self.is_shutdown and not rospy.is_shutdown():
-            gen = self.grabAndPublish(self.stream)
-            try:
-                self.camera.capture_sequence(gen,
-                                             'jpeg',
-                                             use_video_port=True,
-                                             splitter_port=0)
-            except StopIteration:
-                pass
-
-            # Update the camera parameters
-            self.camera.framerate = self.parameters['~framerate']
-            self.camera.resolution = (self.parameters['~res_w'], self.parameters['~res_h'])
-            self.camera.exposure_mode = self.parameters['~exposure_mode']
-
-            # Update the camera info parameters
-            #self.updateCameraParameters()
-
-            self.parametersChanged = False
-            self.log("Parameters updated.")
-
-        self.camera.close()
-        self.log("Capture Ended.")
-
-    def grabAndPublish(self, stream):
-        """Captures a frame from stream and publishes it.
-
-            If the stream is stable (no parameter updates or shutdowns),
-            grabs a frame, creates the image message and publishes it. If there is a paramter change,
-            it does raises StopIteration exception which is caught by `startCapturing`. It updates the
-            camera parameters and restarts the recording.
-
-            Args:
-                stream (:obj:`BytesIO`): imagery stream
-                publisher (:obj:`Publisher`): publisher of topic
-        """
-        while not (self.parametersChanged or self.is_shutdown or rospy.is_shutdown()):
-            yield stream
-            # Construct image_msg
-            # Grab image from stream
-            stamp = rospy.Time.now()
-            stream.seek(0)
-            stream_data = stream.getvalue()
-
-            # Generate and publish the compressed image
-            image_msg = CompressedImage()
-            image_msg.format = "jpeg"
-            image_msg.data = stream_data
-            image_msg.header.stamp = stamp
-            image_msg.header.frame_id = self.frame_id
-            self.pub_img.publish(image_msg)
-
-            # Publish the CameraInfo message
-            self.current_camera_info.header.stamp = stamp
-            self.pub_camera_info.publish(self.current_camera_info)
-
-            # Clear stream
-            stream.seek(0)
-            stream.truncate()
-
-            if not self.has_published:
-                self.log("Published the first image.")
-                self.has_published = True
-
-            rospy.sleep(rospy.Duration.from_sec(0.001))
-
-    def cbSrvSetCameraInfo(self, req):
-        self.log("[cbSrvSetCameraInfo] Callback!")
-        filename = self.cali_file_folder + rospy.get_namespace().strip("/") + ".yaml"
-        response = SetCameraInfoResponse()
-        response.success = self.saveCameraInfo(req.camera_info, filename)
-        response.status_message = "Write to %s" % filename
-        return response
-
-    def saveCameraInfo(self, camera_info_msg, filename):
-        """Saves intrinsic calibration to file.
-
-            Args:
-                camera_info_msg (:obj:`CameraInfo`): Camera Info containg calibration
-                filename (:obj:`str`): filename where to save calibration
-        """
-        # Convert camera_info_msg and save to a yaml file
-        self.log("[saveCameraInfo] filename: %s" % (filename))
-
-        # Converted from camera_info_manager.py
-        calib = {'image_width': camera_info_msg.width,
-                 'image_height': camera_info_msg.height,
-                 'camera_name': rospy.get_name().strip("/"),  # TODO check this
-                 'distortion_model': camera_info_msg.distortion_model,
-                 'distortion_coefficients': {'data': camera_info_msg.D,
-                                             'rows': 1,
-                                             'cols': 5},
-                 'camera_matrix': {'data': camera_info_msg.K,
-                                   'rows': 3,
-                                   'cols': 3},
-                 'rectification_matrix': {'data': camera_info_msg.R,
-                                          'rows': 3,
-                                          'cols': 3},
-                 'projection_matrix': {'data': camera_info_msg.P,
-                                       'rows': 3,
-                                       'cols': 4}}
-
-        self.log("[saveCameraInfo] calib %s" % (calib))
+        # Load map yaml file
+        myargv = rospy.myargv(argv=sys.argv)
+        self.mapfile = str(myargv[1])
 
         try:
-            f = open(filename, 'w')
-            yaml.safe_dump(calib, f)
-            return True
-        except IOError:
-            return False
+            mapfile_dir = ("/code/catkin_ws/src/cra1/packages/augmented_reality/map/{}.yaml".format(self.mapfile))
+            self.map = yaml_load_file(mapfile_dir)
+            rospy.loginfo("Loaded {}.yaml".format(self.mapfile))
+        except:
+            rospy.loginfo("ERROR:Unable to find {}.yaml".format(self.mapfile))
+            rospy.signal_shutdown("Found no map file ... aborting")
 
-    def updateCameraParameters(self):
-        """ Update the camera parameters based on the current resolution.
+        # Load homography
+        self.H = self.load_homography()
+        self.Hinv = np.linalg.inv(self.H)
+        self.pcm_ = PinholeCameraModel()
 
-        The camera matrix, rectification matrix, and projection matrix depend on the resolution
-        of the image. As the calibration has been done at a specific resolution, these matrices need
-        to be adjusted if a different resolution is being used.
+        #Load camera parameter
+        cam_info = self.load_camera_info()
+        self.pcm_.width = cam_info.width
+        self.pcm_.height = cam_info.height
+        self.pcm_.K = cam_info.K 
+        self.pcm_.D = cam_info.D 
+        self.pcm_.R = cam_info.R 
+        self.pcm_.P = cam_info.P 
 
-        TODO: Test that this really works.
-        """
+        #Load camera resolution
+        self.res_w = 640
+        self.res_h = 480
+        rospy.set_param('/%s/camera_node/exposure_mode' %(self.veh_name) , 'off')
+        rospy.set_param('/%s/camera_node/res_w' %(self.veh_name), self.res_w)
+        rospy.set_param('/%s/camera_node/res_h' %(self.veh_name), self.res_h)
 
-        scale_width = float(self.parameters['~res_w']) / self.original_camera_info.width
-        scale_height = float(self.parameters['~res_h']) / self.original_camera_info.height
+        #Initialize ROS topics
+        self.pub = rospy.Publisher("/{}/augmented_reality_node/{}/image/compressed".format(self.veh_name, self.mapfile), CompressedImage, queue_size=1)
+        rospy.loginfo("Publishing augmented reality")
+        self.sub_image = rospy.Subscriber("/{}/camera_node/image/compressed".format(self.veh_name), CompressedImage, self.callback, queue_size=1)
 
-        scale_matrix = np.ones(9)
-        scale_matrix[0] *= scale_width
-        scale_matrix[2] *= scale_width
-        scale_matrix[4] *= scale_height
-        scale_matrix[5] *= scale_height
+    def load_homography(self):
+        '''Load homography (extrinsic parameters)'''
+        filename = ("/code/catkin_ws/src/cra1/calibrations/camera_extrinsic/"+ self.veh_name + ".yaml")
+        
+        rospy.loginfo("Using extrinsic calibration of " + self.veh_name)
+        data = yaml_load_file(filename)
+        rospy.loginfo("Loaded homography for {}".format(self.veh_name))
+        return np.array(data['homography']).reshape((3,3))
 
-        # Adjust the camera matrix resolution
-        self.current_camera_info.height = self.parameters['~res_h']
-        self.current_camera_info.width = self.parameters['~res_w']
-
-        # Adjust the K matrix
-        self.current_camera_info.K = np.array(self.original_camera_info.K) * scale_matrix
-
-        # Adjust the P matrix (done by Rohit)
-        scale_matrix = np.ones(12)
-        scale_matrix[0] *= scale_width
-        scale_matrix[2] *= scale_width
-        scale_matrix[5] *= scale_height
-        scale_matrix[6] *= scale_height
-        self.current_camera_info.P = np.array(self.original_camera_info.P) * scale_matrix
-
-
-    def loadCameraInfo(self, filename):
-        """Loads the camera calibration files.
-
-        Loads the intrinsic and extrinsic camera matrices.
-
-        Args:
-            filename (:obj:`str`): filename of calibration files.
-
-        Returns:
-            :obj:`CameraInfo`: a CameraInfo message object
-
-        """
-        stream = file(filename, 'r')
-        calib_data = yaml.load(stream)
+    def load_camera_info(self):
+        '''Load camera intrinsics'''
+        filename = ("/code/catkin_ws/src/cra1/calibrations/camera_intrinsic/" + self.veh_name + ".yaml")
+        calib_data = yaml_load_file(filename)
         cam_info = CameraInfo()
         cam_info.width = calib_data['image_width']
         cam_info.height = calib_data['image_height']
-        cam_info.K = calib_data['camera_matrix']['data']
-        cam_info.D = calib_data['distortion_coefficients']['data']
-        cam_info.R = calib_data['rectification_matrix']['data']
-        cam_info.P = calib_data['projection_matrix']['data']
+        cam_info.K = np.array(calib_data['camera_matrix']['data']).reshape((3,3))
+        cam_info.D = np.array(calib_data['distortion_coefficients']['data']).reshape((1,5))
+        cam_info.R = np.array(calib_data['rectification_matrix']['data']).reshape((3,3))
+        cam_info.P = np.array(calib_data['projection_matrix']['data']).reshape((3,4))
         cam_info.distortion_model = calib_data['distortion_model']
+        rospy.loginfo("Loaded camera calibration parameters for {}".format(self.veh_name))
         return cam_info
 
+    def process_image(self, cv_image_raw):
+        '''Undistort image'''
+        cv_image_rectified = np.zeros(np.shape(cv_image_raw))
+        mapx = np.ndarray(shape=(self.pcm_.height, self.pcm_.width, 1), dtype='float32')
+        mapy = np.ndarray(shape=(self.pcm_.height, self.pcm_.width, 1), dtype='float32')
+        mapx, mapy = cv2.initUndistortRectifyMap(self.pcm_.K, self.pcm_.D, self.pcm_.R, self.pcm_.P, (self.pcm_.width, self.pcm_.height), cv2.CV_32FC1, mapx, mapy)
+        return cv2.remap(cv_image_raw, mapx, mapy, cv2.INTER_CUBIC, cv_image_rectified)
+
+    def ground2pixel(self, x,y):
+        ground_point = np.array([x, y, 1.0])
+        image_point = np.dot(self.Hinv, ground_point)
+        image_point = image_point / image_point[2]
+        u = image_point[0]
+        v = image_point[1]
+        return int(u), int(v)
+
+    def draw_segment(self, image, pt_x, pt_y, color):
+        defined_colors = {
+            'red': ['rgb', [1, 0, 0]],
+            'green': ['rgb', [0, 1, 0]],
+            'blue': ['rgb', [0, 0, 1]],
+            'yellow': ['rgb', [1, 1, 0]],
+            'magenta': ['rgb', [1, 0 , 1]],
+            'cyan': ['rgb', [0, 1, 1]],
+            'white': ['rgb', [1, 1, 1]],
+            'black': ['rgb', [0, 0, 0]]}
+        _color_type, [r, g, b] = defined_colors[color]
+        cv2.line(image, (pt_x[0], pt_y[0]), (pt_x[1], pt_y[1]), (b * 255, g * 255, r * 255), 5)
+        return image
+
+    def render_segments(self, index):
+        focus_point1 = self.map['segments'][index]['points'][0]
+        focus_point2 = self.map['segments'][index]['points'][1]
+        color = self.map['segments'][index]['color']
+
+        ref_frame1 = self.map['points'][focus_point1][0]
+        if ref_frame1 == 'axle':
+            x1, y1, _ = self.map['points'][focus_point1][1]
+            x1, y1 = self.ground2pixel(x1, y1)
+        if ref_frame1 == 'image01':
+            x1, y1 = self.map['points'][focus_point1][1]
+            x1, y1 = x1*self.res_w, y1*self.res_h
+
+        ref_frame2 = self.map['points'][focus_point2][0]
+        if ref_frame2 == 'axle':
+            x2, y2, _ = self.map['points'][focus_point2][1]
+            x2, y2 = self.ground2pixel(x2, y2)
+        if ref_frame2 == 'image01':
+            x2, y2 = self.map['points'][focus_point2][1]
+            x2, y2 = x2*self.res_w, y2*self.res_h
+
+        return x1, y1, x2, y2, color
+
+    def callback(self, data):
+        #Convert compressed image to BGR
+        np_arr = np.fromstring(data.data, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        img_undistorted = self.process_image(img)
+
+        for index in range(len(self.map['segments'])):
+            x1, y1, x2, y2, color = self.render_segments(index)
+            img_undistorted = self.draw_segment(img_undistorted, [x1, x2], [y1,y2], color)
+
+        compressed_img = br.cv2_to_compressed_imgmsg(img_undistorted, dst_format='jpg')
+
+        self.pub.publish(compressed_img)
 
 if __name__ == '__main__':
     # Initialize the node
+    br = CvBridge()
     augmented_reality_node = Augmenter(node_name='augmenter')
-    # Start the image capturing in a separate thread
-    thread.start_new_thread(augmented_reality_node.startCapturing, ())
     # Keep it spinning to keep the node alive
     rospy.spin()    

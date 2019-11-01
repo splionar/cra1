@@ -3,6 +3,7 @@ project(augmented_reality)
 
 find_package(catkin REQUIRED COMPONENTS
   rospy
+  image_geometry
 )
 
 catkin_package()
